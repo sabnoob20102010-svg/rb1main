@@ -1,0 +1,2302 @@
+-- AutoFarm Brainrots Script
+-- Automatically purchases brainrots from workspace
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+local PathfindingService = game:GetService("PathfindingService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+
+local LocalPlayer = Players.LocalPlayer
+local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
+local Humanoid = Character:WaitForChild("Humanoid")
+
+print("=== AutoFarm Brainrots Started ===")
+
+-- Wait for required services
+local Packages = ReplicatedStorage:WaitForChild("Packages")
+local Net = require(Packages:WaitForChild("Net"))
+local RemoteEvent = Net:RemoteEvent("156ed911-fc4b-4d24-a648-acd1e9761e4f")
+local SellRemoteEvent = Packages.Net:WaitForChild("RE/PlotService/Sell") -- Sell remote event
+local RebirthRemoteFunction = Net:RemoteFunction("Rebirth/RequestRebirth")
+local YinYangSpinRemoteEvent = Net:RemoteEvent("YinYangEventService/Spin")
+
+-- Configuration
+local PURCHASE_DISTANCE = 10 -- Distance to be within to purchase
+local CHECK_INTERVAL = 0.2 -- Check frequently
+local HOLD_DURATION = 0.75 -- Hold E for 0.75 seconds
+local COLLECT_INTERVAL = 20 -- Collect money every 20 seconds
+local REBIRTH_CASH_THRESHOLD = 1100000 -- Trigger rebirth prep when cash >= $1.1M
+local REBIRTH_RETRY_DELAY = 15 -- Minimum seconds between rebirth attempts
+local TARGET_ANIMALS = { "Gangster Footera", "Trippi Troppi" }
+local YINYANG_CASH_THRESHOLD = 25 -- Spin wheel when cash below this
+local YINYANG_DROUGHT_SECONDS = 90 -- Duration under threshold before spinning
+
+-- State management
+local playerPlotId = nil
+local isLockingBase = false
+local isCollecting = false
+local isUpgrading = false
+local lastCollectTime = 0
+local currentActivity = nil -- Tracks what we're doing: "purchasing", "collecting", "locking", "upgrading", nil
+local rebirthSequenceActive = false
+local rebirthSequenceCompleted = false
+local lastRebirthAttempt = 0
+local lastLowCashStart = nil
+local lastYinYangSpinAttempt = 0
+local scriptStartTime = tick()
+
+-- Optimization caches
+local baseFullCache = {value = false, lastCheck = 0, checkInterval = 2}
+local lowestGenCache = {data = nil, lastCheck = 0, checkInterval = 3}
+local scannedAnimals = {} -- Track animals we've already evaluated
+local requiredAnimalOwnedCache = {}
+
+-- Utility: clear required animal ownership cache when data potentially changes
+local function InvalidateRequiredAnimalCache()
+    table.clear(requiredAnimalOwnedCache)
+end
+
+-- UI: Black overlay with status to reduce rendering load
+local overlayGui, overlayBg, overlayTitle, overlayStatus, overlayUser, overlayTimer = nil, nil, nil, nil, nil, nil
+local overlayRebirthTime = nil
+local rebirthAchievedTime = nil
+local rebirthAchievedTimeText = nil
+
+local function CreateStatusOverlay()
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui")
+    -- Reuse if exists
+    local existing = playerGui:FindFirstChild("AutoFarmOverlay")
+    if existing then
+        overlayGui = existing
+        overlayBg = existing:FindFirstChild("BlackCover")
+        if overlayBg then
+            overlayTitle = overlayBg:FindFirstChild("Title", true)
+            overlayStatus = overlayBg:FindFirstChild("Status", true)
+            overlayUser = overlayBg:FindFirstChild("User", true)
+            overlayTimer = overlayBg:FindFirstChild("Timer", true)
+            overlayRebirthTime = overlayBg:FindFirstChild("RebirthTime", true)
+        end
+        return overlayGui
+    end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "AutoFarmOverlay"
+    gui.IgnoreGuiInset = true
+    gui.ResetOnSpawn = false
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Global
+    gui.DisplayOrder = 9999
+    gui.Parent = playerGui
+
+    local bg = Instance.new("Frame")
+    bg.Name = "BlackCover"
+    bg.Size = UDim2.fromScale(1, 1)
+    bg.Position = UDim2.new(0, 0, 0, 0)
+    bg.BackgroundColor3 = Color3.new(0, 0, 0)
+    bg.BackgroundTransparency = 0
+    bg.BorderSizePixel = 0
+    bg.Parent = gui
+
+    local title = Instance.new("TextLabel")
+    title.Name = "Title"
+    title.BackgroundTransparency = 1
+    title.Size = UDim2.new(1, -40, 0, 70)
+    title.AnchorPoint = Vector2.new(0.5, 0)
+    title.Position = UDim2.new(0.5, 0, 0.1, 0)
+    title.Font = Enum.Font.GothamBold
+    title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    title.Text = "Auto rebirth 1  •  made by duooolingo."
+    title.TextSize = 64
+    title.TextXAlignment = Enum.TextXAlignment.Center
+    title.Parent = bg
+
+    -- Center content container
+    local center = Instance.new("Frame")
+    center.Name = "CenterStack"
+    center.BackgroundTransparency = 1
+    center.Size = UDim2.new(1, 0, 0, 220)
+    center.AnchorPoint = Vector2.new(0.5, 0.5)
+    center.Position = UDim2.new(0.5, 0, 0.5, 0)
+    center.Parent = bg
+
+    local layout = Instance.new("UIListLayout")
+    layout.FillDirection = Enum.FillDirection.Vertical
+    layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    layout.VerticalAlignment = Enum.VerticalAlignment.Center
+    layout.Padding = UDim.new(0, 10)
+    layout.Parent = center
+
+    local userLbl = Instance.new("TextLabel")
+    userLbl.Name = "User"
+    userLbl.BackgroundTransparency = 1
+    userLbl.Size = UDim2.new(1, -40, 0, 40)
+    userLbl.Font = Enum.Font.Gotham
+    userLbl.TextColor3 = Color3.fromRGB(220, 220, 220)
+    userLbl.TextXAlignment = Enum.TextXAlignment.Center
+    userLbl.TextSize = 32
+    userLbl.Text = "Farming: " .. LocalPlayer.Name
+    userLbl.Parent = center
+
+    local timerLbl = Instance.new("TextLabel")
+    timerLbl.Name = "Timer"
+    timerLbl.BackgroundTransparency = 1
+    timerLbl.Size = UDim2.new(1, -40, 0, 40)
+    timerLbl.Font = Enum.Font.Gotham
+    timerLbl.TextColor3 = Color3.fromRGB(220, 220, 220)
+    timerLbl.TextXAlignment = Enum.TextXAlignment.Center
+    timerLbl.TextSize = 32
+    timerLbl.Text = "Uptime: 00:00:00"
+    timerLbl.Parent = center
+
+    local statusLbl = Instance.new("TextLabel")
+    statusLbl.Name = "Status"
+    statusLbl.BackgroundTransparency = 1
+    statusLbl.Size = UDim2.new(1, -40, 0, 40)
+    statusLbl.Font = Enum.Font.Gotham
+    statusLbl.TextColor3 = Color3.fromRGB(220, 220, 220)
+    statusLbl.TextXAlignment = Enum.TextXAlignment.Center
+    statusLbl.TextSize = 32
+    statusLbl.Text = "Status: initializing..."
+    statusLbl.Parent = center
+
+    local rebirthLbl = Instance.new("TextLabel")
+    rebirthLbl.Name = "RebirthTime"
+    rebirthLbl.BackgroundTransparency = 1
+    rebirthLbl.Size = UDim2.new(1, -40, 0, 40)
+    rebirthLbl.Font = Enum.Font.Gotham
+    rebirthLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+    rebirthLbl.TextXAlignment = Enum.TextXAlignment.Center
+    rebirthLbl.TextSize = 22
+    rebirthLbl.Text = ""
+    rebirthLbl.Visible = false
+    rebirthLbl.Parent = center
+
+    overlayGui, overlayBg = gui, bg
+    overlayTitle, overlayStatus, overlayUser, overlayTimer = title, statusLbl, userLbl, timerLbl
+    overlayRebirthTime = rebirthLbl
+    return gui
+end
+
+local function CreateOrEnsureOverlay()
+    if overlayGui and overlayGui.Parent then return true end
+    local success = pcall(CreateStatusOverlay)
+    return success and overlayGui ~= nil
+end
+
+-- UI helpers: formatting and status updater
+local function FormatHMS(seconds)
+    seconds = math.max(0, math.floor(seconds))
+    local s = seconds % 60
+    local m = (seconds // 60) % 60
+    local h = seconds // 3600
+    return string.format("%02d:%02d:%02d", h, m, s)
+end
+
+local function GetRebirthCount()
+    local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
+    if leaderstats then
+        local r = leaderstats:FindFirstChild("Rebirths")
+        if r and (r:IsA("NumberValue") or r:IsA("IntValue")) then
+            return r.Value
+        end
+    end
+    return 0
+end
+
+local function UpdateOverlayStatus()
+    if not overlayGui or not overlayGui.Parent then return end
+    if overlayUser then
+        overlayUser.Text = "Farming: " .. LocalPlayer.Name
+    end
+    if overlayTimer then
+        overlayTimer.Text = "Uptime: " .. FormatHMS(tick() - scriptStartTime)
+    end
+    if overlayStatus then
+        local statusText = "initializing..."
+        local reb = GetRebirthCount()
+        if reb >= 1 then
+            statusText = "done"
+            if not rebirthAchievedTime then
+                rebirthAchievedTime = os.time()
+                rebirthAchievedTimeText = os.date("%I:%M:%S %p", rebirthAchievedTime)
+            end
+        elseif isLockingBase then
+            statusText = "locking base"
+        elseif rebirthSequenceActive then
+            statusText = "rebirthing"
+        elseif isCollecting then
+            statusText = "collecting"
+        elseif isUpgrading then
+            statusText = "upgrading"
+        elseif currentActivity then
+            statusText = tostring(currentActivity)
+        else
+            statusText = "idle"
+        end
+        overlayStatus.Text = "Status: " .. statusText
+    end
+    if overlayRebirthTime then
+        if rebirthAchievedTimeText then
+            overlayRebirthTime.Text = "Rebirth 1 at: " .. rebirthAchievedTimeText
+            overlayRebirthTime.Visible = true
+        else
+            overlayRebirthTime.Visible = false
+        end
+    end
+end
+
+-- Find player's plot ID
+local function FindPlayerPlot()
+    local playerName = LocalPlayer.Name
+    local expectedText = playerName .. "'s Base"
+    
+    local plots = Workspace:FindFirstChild("Plots")
+    if not plots then
+        warn("[WARNING] Plots folder not found!")
+        return nil
+    end
+    
+    print("[INFO] Scanning plots to find your base...")
+    
+    for plotId, plot in pairs(plots:GetChildren()) do
+        if plot:IsA("Model") then
+            local plotSign = plot:FindFirstChild("PlotSign")
+            if plotSign then
+                local surfaceGui = plotSign:FindFirstChild("SurfaceGui")
+                if surfaceGui then
+                    local frame = surfaceGui:FindFirstChild("Frame")
+                    if frame then
+                        local textLabel = frame:FindFirstChild("TextLabel")
+                        if textLabel and textLabel:IsA("TextLabel") then
+                            if textLabel.Text == expectedText then
+                                print("[SUCCESS] Found your base! Plot ID:", plot.Name)
+                                return plot.Name
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    
+    warn("[WARNING] Could not find your base plot!")
+    return nil
+end
+
+-- Get remaining time for base unlock
+local function GetBaseRemainingTime()
+    if not playerPlotId then
+        return nil
+    end
+    
+    local plots = Workspace:FindFirstChild("Plots")
+    if not plots then
+        return nil
+    end
+    
+    local plot = plots:FindFirstChild(playerPlotId)
+    if not plot then
+        return nil
+    end
+    
+    local purchases = plot:FindFirstChild("Purchases")
+    if not purchases then
+        return nil
+    end
+    
+    local plotBlock = purchases:FindFirstChild("PlotBlock")
+    if not plotBlock then
+        return nil
+    end
+    
+    local main = plotBlock:FindFirstChild("Main")
+    if not main then
+        return nil
+    end
+    
+    local billboardGui = main:FindFirstChild("BillboardGui")
+    if not billboardGui then
+        return nil
+    end
+    
+    local remainingTime = billboardGui:FindFirstChild("RemainingTime")
+    if not remainingTime or not remainingTime:IsA("TextLabel") then
+        return nil
+    end
+    
+    return remainingTime.Text
+end
+
+-- Check if base is unlocked (0s)
+local function IsBaseUnlocked()
+    local timeText = GetBaseRemainingTime()
+    if not timeText then
+        return false
+    end
+    
+    -- Check if it says "0s" or "0 s" or exactly "0" (not "0.5s" or similar)
+    local timeStr = timeText:gsub("%s", "") -- Remove spaces
+    -- Match exactly "0s" or "0" (not starting with 0, but exactly 0)
+    if timeStr == "0s" or timeStr == "0" then
+        return true
+    end
+    
+    -- Also check if it's a number that equals 0
+    local numStr = timeStr:gsub("[^%d%.]", "") -- Extract numbers
+    local num = tonumber(numStr)
+    if num and num == 0 then
+        return true
+    end
+    
+    return false
+end
+
+-- Walk to base lock part
+local function WalkToBaseLock()
+    if not playerPlotId then
+        return false
+    end
+    
+    local plots = Workspace:FindFirstChild("Plots")
+    if not plots then
+        return false
+    end
+    
+    local plot = plots:FindFirstChild(playerPlotId)
+    if not plot then
+        return false
+    end
+    
+    local purchases = plot:FindFirstChild("Purchases")
+    if not purchases then
+        return false
+    end
+    
+    local plotBlock = purchases:FindFirstChild("PlotBlock")
+    if not plotBlock then
+        return false
+    end
+    
+    local main = plotBlock:FindFirstChild("Main")
+    if not main then
+        return false
+    end
+    
+    return main
+end
+
+-- Simple smooth walk to position (dedicated for base locking)
+local function WalkToBasePosition(targetPart)
+    if not targetPart or not targetPart.Parent then
+        return false
+    end
+    
+    -- Refresh character references
+    if not Character or not Character.Parent then
+        Character = LocalPlayer.Character
+        if not Character then
+            return false
+        end
+    end
+    
+    local hrp = Character:FindFirstChild("HumanoidRootPart")
+    local hum = Character:FindFirstChild("Humanoid")
+    
+    if not hrp or not hum then
+        return false
+    end
+    
+    local targetPos = targetPart.Position
+    local lastPathTime = 0
+    local pathUpdateInterval = 0.2
+    local maxTime = 15
+    local startTime = tick()
+    local connection = nil
+    local waypoints = {}
+    local waypointIndex = 2
+    
+    connection = RunService.Heartbeat:Connect(function()
+        -- Refresh references each frame
+        if not Character or not Character.Parent then
+            Character = LocalPlayer.Character
+            if not Character then
+                if connection then connection:Disconnect() end
+                return
+            end
+        end
+        
+        hrp = Character:FindFirstChild("HumanoidRootPart")
+        hum = Character:FindFirstChild("Humanoid")
+        
+        if not hrp or not hum or not hrp.Parent or not hum.Parent then
+            if connection then connection:Disconnect() end
+            return
+        end
+        
+        if not targetPart or not targetPart.Parent then
+            if connection then connection:Disconnect() end
+            return
+        end
+        
+        targetPos = targetPart.Position
+        local distance = (hrp.Position - targetPos).Magnitude
+        
+        -- Check timeout
+        if tick() - startTime > maxTime then
+            if connection then connection:Disconnect() end
+            return
+        end
+        
+        -- If close enough, stop
+        if distance <= 5 then
+            pcall(function() hum:MoveTo(hrp.Position) end)
+            if connection then connection:Disconnect() end
+            return
+        end
+        
+        -- Update path periodically
+        local currentTime = tick()
+        if (currentTime - lastPathTime) >= pathUpdateInterval then
+            local pathSuccess, path = pcall(function()
+                return PathfindingService:CreatePath({
+                    AgentRadius = 2,
+                    AgentHeight = 5,
+                    AgentCanJump = true
+                })
+            end)
+            
+            if pathSuccess and path then
+                local computeSuccess = pcall(function()
+                    path:ComputeAsync(hrp.Position, targetPos)
+                end)
+                
+                if computeSuccess and path.Status == Enum.PathStatus.Success then
+                    waypoints = path:GetWaypoints()
+                    waypointIndex = 2
+                    lastPathTime = currentTime
+                end
+            end
+        end
+        
+        -- Move along path
+        if #waypoints > 1 and waypointIndex <= #waypoints then
+            local waypoint = waypoints[waypointIndex]
+            local waypointDist = (hrp.Position - waypoint.Position).Magnitude
+            
+            if waypointDist < 4 then
+                waypointIndex = waypointIndex + 1
+                if waypointIndex <= #waypoints then
+                    pcall(function() hum:MoveTo(waypoints[waypointIndex].Position) end)
+                else
+                    pcall(function() hum:MoveTo(targetPos) end)
+                end
+            else
+                pcall(function() hum:MoveTo(waypoint.Position) end)
+            end
+        else
+            pcall(function() hum:MoveTo(targetPos) end)
+        end
+    end)
+    
+    -- Wait for completion
+    while connection and connection.Connected do
+        task.wait(0.1)
+    end
+    
+    return true
+end
+
+-- Lock the base by walking to it or jumping if already there (HIGHEST PRIORITY)
+local function LockBase()
+    if isLockingBase then
+        return
+    end
+    
+    isLockingBase = true
+    currentActivity = "locking"
+    print("[PRIORITY 1] Base is unlocked! Going to lock it...")
+    
+    -- Get base lock part
+    local mainPart = WalkToBaseLock()
+    if not mainPart then
+        print("[WARNING] Could not find base lock part!")
+        isLockingBase = false
+        currentActivity = nil
+        return
+    end
+    
+    task.spawn(function()
+        -- Refresh character references
+        if not Character or not Character.Parent then
+            Character = LocalPlayer.Character
+            if not Character then
+                Character = LocalPlayer.CharacterAdded:Wait()
+            end
+        end
+        
+        local hrp = Character:FindFirstChild("HumanoidRootPart")
+        local hum = Character:FindFirstChild("Humanoid")
+        
+        if not hrp or not hum then
+            print("[WARNING] Character parts not found!")
+            isLockingBase = false
+            return
+        end
+        
+        -- Check if we're already on the part or very close
+        local distance = (hrp.Position - mainPart.Position).Magnitude
+        if distance <= 8 then
+            print("[INFO] Already near base lock part, jumping to trigger lock...")
+            
+            -- Jump multiple times to ensure it registers
+            local maxAttempts = 15
+            local attempts = 0
+            
+            while IsBaseUnlocked() and attempts < maxAttempts do
+                -- Use VirtualInputManager for reliable jumping
+                pcall(function()
+                    VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
+                    task.wait(0.05)
+                    VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
+                end)
+                
+                -- Also set Jump property as backup
+                if hum and hum.Parent then
+                    hum.Jump = true
+                end
+                
+                attempts = attempts + 1
+                task.wait(0.2)
+            end
+            
+            if IsBaseUnlocked() then
+                print("[WARNING] Base still unlocked after jumping, walking over it...")
+                -- Walk back and forth over the part
+                local offset = Vector3.new(5, 0, 0)
+                pcall(function() hum:MoveTo(mainPart.Position + offset) end)
+                task.wait(1)
+                pcall(function() hum:MoveTo(mainPart.Position - offset) end)
+                task.wait(1)
+            end
+            print("[SUCCESS] Base relocked!")
+        else
+            print("[INFO] Walking to base lock part...")
+            -- Walk to the part
+            WalkToBasePosition(mainPart)
+            
+            -- Check if we reached it
+            hrp = Character:FindFirstChild("HumanoidRootPart")
+            hum = Character:FindFirstChild("Humanoid")
+            if hrp and hum then
+                distance = (hrp.Position - mainPart.Position).Magnitude
+                if distance <= 8 then
+                    print("[INFO] On base lock part, jumping to trigger lock...")
+                    
+                    -- Jump multiple times with VirtualInputManager
+                    local maxAttempts = 15
+                    local attempts = 0
+                    
+                    while IsBaseUnlocked() and attempts < maxAttempts do
+                        -- Use VirtualInputManager for reliable jumping
+                        pcall(function()
+                            VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
+                            task.wait(0.05)
+                            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
+                        end)
+                        
+                        -- Also set Jump property as backup
+                        if hum and hum.Parent then
+                            hum.Jump = true
+                        end
+                        
+                        attempts = attempts + 1
+                        task.wait(0.2)
+                    end
+                    
+                    if IsBaseUnlocked() then
+                        print("[WARNING] Base still unlocked, walking over it...")
+                        -- Walk back and forth
+                        local offset = Vector3.new(5, 0, 0)
+                        pcall(function() hum:MoveTo(mainPart.Position + offset) end)
+                        task.wait(1)
+                        pcall(function() hum:MoveTo(mainPart.Position - offset) end)
+                        task.wait(1)
+                    end
+                    
+                    print("[SUCCESS] Base relocked!")
+                else
+                    print("[WARNING] Could not reach base lock part, distance:", math.floor(distance))
+                end
+            end
+        end
+        
+        isLockingBase = false
+        currentActivity = nil
+    end)
+end
+
+-- Walk to a specific position and wait until reached
+local function WalkToPosition(targetPosition, maxDistance)
+    maxDistance = maxDistance or 5
+    
+    if not Character or not Character.Parent then
+        Character = LocalPlayer.Character
+        if not Character then
+            return false
+        end
+    end
+    
+    local hrp = Character:FindFirstChild("HumanoidRootPart")
+    local hum = Character:FindFirstChild("Humanoid")
+    
+    if not hrp or not hum then
+        return false
+    end
+    
+    local lastPathTime = 0
+    local pathUpdateInterval = 0.2
+    local maxTime = 15
+    local startTime = tick()
+    local connection = nil
+    local waypoints = {}
+    local waypointIndex = 2
+    
+    connection = RunService.Heartbeat:Connect(function()
+        -- Refresh references
+        if not Character or not Character.Parent then
+            Character = LocalPlayer.Character
+            if not Character then
+                if connection then connection:Disconnect() end
+                return
+            end
+        end
+        
+        hrp = Character:FindFirstChild("HumanoidRootPart")
+        hum = Character:FindFirstChild("Humanoid")
+        
+        if not hrp or not hum or not hrp.Parent or not hum.Parent then
+            if connection then connection:Disconnect() end
+            return
+        end
+        
+        local distance = (hrp.Position - targetPosition).Magnitude
+        
+        -- Check timeout
+        if tick() - startTime > maxTime then
+            if connection then connection:Disconnect() end
+            return
+        end
+        
+        -- If close enough, stop
+        if distance <= maxDistance then
+            pcall(function() hum:MoveTo(hrp.Position) end)
+            if connection then connection:Disconnect() end
+            return
+        end
+        
+        -- Update path periodically
+        local currentTime = tick()
+        if (currentTime - lastPathTime) >= pathUpdateInterval then
+            local pathSuccess, path = pcall(function()
+                return PathfindingService:CreatePath({
+                    AgentRadius = 2,
+                    AgentHeight = 5,
+                    AgentCanJump = true
+                })
+            end)
+            
+            if pathSuccess and path then
+                local computeSuccess = pcall(function()
+                    path:ComputeAsync(hrp.Position, targetPosition)
+                end)
+                
+                if computeSuccess and path.Status == Enum.PathStatus.Success then
+                    waypoints = path:GetWaypoints()
+                    waypointIndex = 2
+                    lastPathTime = currentTime
+                end
+            end
+        end
+        
+        -- Move along path
+        if #waypoints > 1 and waypointIndex <= #waypoints then
+            local waypoint = waypoints[waypointIndex]
+            local waypointDist = (hrp.Position - waypoint.Position).Magnitude
+            
+            if waypointDist < 4 then
+                waypointIndex = waypointIndex + 1
+                if waypointIndex <= #waypoints then
+                    pcall(function() hum:MoveTo(waypoints[waypointIndex].Position) end)
+                else
+                    pcall(function() hum:MoveTo(targetPosition) end)
+                end
+            else
+                pcall(function() hum:MoveTo(waypoint.Position) end)
+            end
+        else
+            pcall(function() hum:MoveTo(targetPosition) end)
+        end
+    end)
+    
+    -- Wait for completion
+    while connection and connection.Connected do
+        task.wait(0.1)
+    end
+    
+    return true
+end
+
+-- Collect money from all 10 podiums (SECOND PRIORITY)
+local function CollectMoney()
+    if isCollecting or not playerPlotId or isLockingBase or rebirthSequenceActive then
+        return
+    end
+    
+    isCollecting = true
+    currentActivity = "collecting"
+    print("[PRIORITY 2] Starting money collection from podiums...")
+    task.spawn(function()
+        local plots = Workspace:FindFirstChild("Plots")
+        if not plots then
+            print("[WARNING] Plots folder not found!")
+            isCollecting = false
+            currentActivity = nil
+            return
+        end
+        
+        local plot = plots:FindFirstChild(playerPlotId)
+        if not plot then
+            print("[WARNING] Your plot not found!")
+            isCollecting = false
+            currentActivity = nil
+            return
+        end
+        
+        local animalPodiums = plot:FindFirstChild("AnimalPodiums")
+        if not animalPodiums then
+            print("[WARNING] AnimalPodiums not found!")
+            isCollecting = false
+            currentActivity = nil
+            return
+        end
+        
+        local collectedCount = 0
+        
+        -- Walk to each podium (1 through 10)
+        for i = 1, 10 do
+            -- Check if base locking takes priority
+            if isLockingBase then
+                print("[INFO] Collection interrupted by base locking, will resume after")
+                break
+            end
+            
+            local podiumName = tostring(i)
+            local podium = animalPodiums:FindFirstChild(podiumName)
+            
+            if podium then
+                local claim = podium:FindFirstChild("Claim")
+                if claim then
+                    local main = claim:FindFirstChild("Main")
+                    if main and main:IsA("BasePart") then
+                        print("[COLLECT] Walking to podium " .. i .. "...")
+                        
+                        -- Walk to the claim part - get close
+                        WalkToPosition(main.Position, 6)
+                        
+                        -- Check if we're close enough
+                        local hrp = Character:FindFirstChild("HumanoidRootPart")
+                        if hrp then
+                            local distance = (hrp.Position - main.Position).Magnitude
+                            
+                            -- If not close enough, try again with closer target
+                            if distance > 12 then
+                                print("[COLLECT] Podium " .. i .. " too far (" .. math.floor(distance) .. " units), retrying...")
+                                WalkToPosition(main.Position, 3)
+                                task.wait(0.2)
+                                hrp = Character:FindFirstChild("HumanoidRootPart")
+                                if hrp then
+                                    distance = (hrp.Position - main.Position).Magnitude
+                                end
+                            end
+                            
+                            -- Check final distance (more lenient)
+                            if distance <= 15 then
+                                print("[COLLECT] ✓ Collected from podium " .. i .. " (distance: " .. math.floor(distance) .. " units)")
+                                collectedCount = collectedCount + 1
+                                task.wait(0.5) -- Slightly longer delay to ensure collection registers
+                            else
+                                print("[WARNING] ✗ Could not reach podium " .. i .. ", distance: " .. math.floor(distance) .. " units")
+                                -- Try one more time for problematic podiums
+                                if i == 5 or i == 10 then
+                                    print("[COLLECT] Retry attempt for podium " .. i .. "...")
+                                    WalkToPosition(main.Position, 2)
+                                    task.wait(0.3)
+                                    hrp = Character:FindFirstChild("HumanoidRootPart")
+                                    if hrp then
+                                        distance = (hrp.Position - main.Position).Magnitude
+                                        if distance <= 15 then
+                                            print("[COLLECT] ✓ Collected from podium " .. i .. " on retry!")
+                                            collectedCount = collectedCount + 1
+                                            task.wait(0.5)
+                                        else
+                                            print("[ERROR] Failed to collect from podium " .. i .. " after retry")
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        
+        if collectedCount > 0 then
+            print("[SUCCESS] Collected money from " .. collectedCount .. " podiums!")
+        else
+            print("[INFO] No podiums were collected from")
+        end
+        
+        lastCollectTime = tick()
+        isCollecting = false
+        currentActivity = nil
+    end)
+end
+
+-- Parse generation value to number for comparison ($1/s -> 1, $1.5K/s -> 1500, $50K/s -> 50000, $2M/s -> 2000000)
+local function ParseGeneration(genText)
+    if not genText or genText == "" then
+        return 0
+    end
+    
+    local lowerGen = genText:lower()
+    
+    -- Remove "/s" suffix
+    lowerGen = lowerGen:gsub("/s", "")
+    
+    -- Check for M (millions)
+    local hasM = lowerGen:find("m")
+    if hasM then
+        local numStr = lowerGen:gsub("[^%d%.]", "")
+        local num = tonumber(numStr) or 0
+        return num * 1000000
+    end
+    
+    -- Check for K (thousands)
+    local hasK = lowerGen:find("k")
+    if hasK then
+        local numStr = lowerGen:gsub("[^%d%.]", "")
+        local num = tonumber(numStr) or 0
+        return num * 1000
+    end
+    
+    -- Regular number
+    local numStr = lowerGen:gsub("[^%d%.]", "")
+    return tonumber(numStr) or 0
+end
+
+-- Check if base is full (all 10 podiums have brainrots) - CACHED
+local function IsBaseFull(forceCheck)
+    -- Use cache if recent enough
+    local now = tick()
+    if not forceCheck and (now - baseFullCache.lastCheck) < baseFullCache.checkInterval then
+        return baseFullCache.value
+    end
+    
+    if not playerPlotId then
+        baseFullCache.value = false
+        baseFullCache.lastCheck = now
+        return false
+    end
+    
+    local plots = Workspace:FindFirstChild("Plots")
+    if not plots then
+        baseFullCache.value = false
+        baseFullCache.lastCheck = now
+        return false
+    end
+    
+    local plot = plots:FindFirstChild(playerPlotId)
+    if not plot then
+        baseFullCache.value = false
+        baseFullCache.lastCheck = now
+        return false
+    end
+    
+    local animalPodiums = plot:FindFirstChild("AnimalPodiums")
+    if not animalPodiums then
+        baseFullCache.value = false
+        baseFullCache.lastCheck = now
+        return false
+    end
+    
+    -- Check all 10 podiums
+    for i = 1, 10 do
+        local podium = animalPodiums:FindFirstChild(tostring(i))
+        if not podium then
+            baseFullCache.value = false
+            baseFullCache.lastCheck = now
+            return false
+        end
+        
+        local base = podium:FindFirstChild("Base")
+        if not base then
+            baseFullCache.value = false
+            baseFullCache.lastCheck = now
+            return false
+        end
+        
+        local spawn = base:FindFirstChild("Spawn")
+        if not spawn then
+            baseFullCache.value = false
+            baseFullCache.lastCheck = now
+            return false
+        end
+        
+        local attachment = spawn:FindFirstChild("Attachment")
+        if not attachment then
+            baseFullCache.value = false
+            baseFullCache.lastCheck = now
+            return false -- No brainrot on this podium
+        end
+    end
+    
+    baseFullCache.value = true
+    baseFullCache.lastCheck = now
+    return true -- All 10 podiums have brainrots
+end
+
+-- Get all podium generations and find the lowest - CACHED
+local function GetLowestGenerationPodium(forceCheck)
+    -- Use cache if recent enough
+    local now = tick()
+    if not forceCheck and (now - lowestGenCache.lastCheck) < lowestGenCache.checkInterval then
+        return lowestGenCache.data
+    end
+    
+    if not playerPlotId then
+        lowestGenCache.data = nil
+        lowestGenCache.lastCheck = now
+        return nil
+    end
+    
+    local plots = Workspace:FindFirstChild("Plots")
+    if not plots then
+        return nil
+    end
+    
+    local plot = plots:FindFirstChild(playerPlotId)
+    if not plot then
+        return nil
+    end
+    
+    local animalPodiums = plot:FindFirstChild("AnimalPodiums")
+    if not animalPodiums then
+        return nil
+    end
+    
+    local lowestGen = math.huge
+    local lowestPodiumNum = nil
+    local lowestGenText = nil
+    
+    -- Scan all 10 podiums
+    for i = 1, 10 do
+        local podium = animalPodiums:FindFirstChild(tostring(i))
+        if podium then
+            local base = podium:FindFirstChild("Base")
+            if base then
+                local spawn = base:FindFirstChild("Spawn")
+                if spawn then
+                    local attachment = spawn:FindFirstChild("Attachment")
+                    if attachment then
+                        local animalOverhead = attachment:FindFirstChild("AnimalOverhead")
+                        if animalOverhead then
+                            local displayName = animalOverhead:FindFirstChild("DisplayName")
+                            local generation = animalOverhead:FindFirstChild("Generation")
+                            local protectedAnimal = false
+                            if displayName and rebirthSequenceActive then
+                                local nameValue = nil
+                                if displayName:IsA("TextLabel") or displayName:IsA("TextButton") or displayName:IsA("TextBox") then
+                                    nameValue = displayName.Text
+                                elseif displayName:IsA("StringValue") then
+                                    nameValue = displayName.Value
+                                end
+                                if nameValue then
+                                    local lowerName = nameValue:lower()
+                                    for _, requiredName in ipairs(TARGET_ANIMALS) do
+                                        if lowerName == requiredName:lower() then
+                                            protectedAnimal = true
+                                            break
+                                        end
+                                    end
+                                end
+                            end
+
+                            if not protectedAnimal and generation then
+                                local genText = ""
+                                if generation:IsA("TextLabel") or generation:IsA("TextButton") or generation:IsA("TextBox") then
+                                    genText = generation.Text
+                                elseif generation:IsA("StringValue") then
+                                    genText = generation.Value
+                                end
+                                
+                                local genValue = ParseGeneration(genText)
+                                if genValue > 0 and genValue < lowestGen then
+                                    lowestGen = genValue
+                                    lowestPodiumNum = i
+                                    lowestGenText = genText
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if lowestPodiumNum then
+        lowestGenCache.data = {
+            PodiumNumber = lowestPodiumNum,
+            Generation = lowestGen,
+            GenerationText = lowestGenText
+        }
+        lowestGenCache.lastCheck = now
+        return lowestGenCache.data
+    end
+
+    lowestGenCache.data = nil
+    lowestGenCache.lastCheck = now
+    return nil
+end
+
+-- Sell brainrot from a specific podium
+local function SellBrainrot(podiumNumber)
+    if not playerPlotId or not podiumNumber then
+        return false
+    end
+
+    local plots = Workspace:FindFirstChild("Plots")
+    if not plots then
+        return false
+    end
+
+    local plot = plots:FindFirstChild(playerPlotId)
+    if not plot then
+        return false
+    end
+
+    local animalPodiums = plot:FindFirstChild("AnimalPodiums")
+    if not animalPodiums then
+        return false
+    end
+
+    local podium = animalPodiums:FindFirstChild(tostring(podiumNumber))
+    if not podium then
+        return false
+    end
+
+    local base = podium:FindFirstChild("Base")
+    if not base then
+        return false
+    end
+
+    local spawn = base:FindFirstChild("Spawn")
+    if not spawn then
+        return false
+    end
+
+    local promptAttachment = spawn:FindFirstChild("PromptAttachment")
+    if not promptAttachment then
+        return false
+    end
+
+    local proximityPrompt = nil
+    for _, child in pairs(promptAttachment:GetChildren()) do
+        if child:IsA("ProximityPrompt") and child.ActionText and child.ActionText:find("Sell") then
+            proximityPrompt = child
+            break
+        end
+    end
+
+    if not proximityPrompt then
+        print("[WARNING] Could not find sell proximity prompt for podium " .. podiumNumber)
+        return false
+    end
+
+    local maxActivationDist = proximityPrompt.MaxActivationDistance or 10
+    local targetDistance = math.max(maxActivationDist - 2, 4)
+
+    local spawnPos = spawn.Position
+    print("[UPGRADE] Walking to podium " .. podiumNumber .. " to sell...")
+    WalkToPosition(spawnPos, targetDistance)
+
+    local hrp = Character:FindFirstChild("HumanoidRootPart")
+    if not hrp then
+        print("[WARNING] Character HumanoidRootPart not found")
+        return false
+    end
+
+    local distance = (hrp.Position - spawnPos).Magnitude
+
+    if distance > maxActivationDist then
+        print("[UPGRADE] Still too far (" .. math.floor(distance) .. " units), walking closer...")
+        WalkToPosition(spawnPos, 3)
+        task.wait(0.3)
+        hrp = Character:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            distance = (hrp.Position - spawnPos).Magnitude
+        end
+    end
+
+    if distance <= maxActivationDist then
+        print("[UPGRADE] In range (" .. math.floor(distance) .. " units), selling brainrot from podium " .. podiumNumber .. "...")
+
+        local soldViaRemote = false
+        if proximityPrompt.Enabled then
+            local success = pcall(function()
+                SellRemoteEvent:FireServer(podiumNumber)
+                print("[UPGRADE] Fired sell remote event for podium " .. podiumNumber)
+                soldViaRemote = true
+            end)
+
+            if not success then
+                print("[WARNING] Failed to fire sell remote, will use proximity prompt")
+            end
+
+            task.wait(1.5)
+        end
+
+        if not soldViaRemote and proximityPrompt.Enabled then
+            print("[UPGRADE] Using proximity prompt as fallback...")
+            pcall(function()
+                proximityPrompt:InputHoldBegin()
+                task.wait(proximityPrompt.HoldDuration or 1.5)
+                proximityPrompt:InputHoldEnd()
+            end)
+            task.wait(0.5)
+        end
+
+        task.wait(0.5)
+        local attachment = spawn:FindFirstChild("Attachment")
+        if not attachment then
+            print("[SUCCESS] Successfully sold brainrot from podium " .. podiumNumber)
+            baseFullCache.lastCheck = 0
+            lowestGenCache.lastCheck = 0
+            InvalidateRequiredAnimalCache()
+            return true
+        else
+            print("[WARNING] Sell may have failed, attachment still exists. Retrying with prompt trigger...")
+            pcall(function()
+                proximityPrompt:InputHoldBegin()
+                task.wait(1.5)
+                proximityPrompt:InputHoldEnd()
+            end)
+
+            task.wait(1)
+            attachment = spawn:FindFirstChild("Attachment")
+            if not attachment then
+                print("[SUCCESS] Sold on retry!")
+                baseFullCache.lastCheck = 0
+                lowestGenCache.lastCheck = 0
+                InvalidateRequiredAnimalCache()
+                return true
+            else
+                print("[ERROR] Failed to sell after multiple attempts")
+                return false
+            end
+        end
+    else
+        print("[WARNING] Too far from podium " .. podiumNumber .. ", distance: " .. math.floor(distance) .. " (max: " .. maxActivationDist .. ")")
+        return false
+    end
+end
+
+-- Get player money
+local function GetPlayerMoney()
+    local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
+    if leaderstats then
+        local cash = leaderstats:FindFirstChild("Cash")
+        if cash and cash:IsA("NumberValue") then
+            return cash.Value
+        end
+    end
+    return 0
+end
+
+-- Check if required animal is already placed on plot (or cached)
+local function IsRequiredAnimalOwned(animalName)
+    if requiredAnimalOwnedCache[animalName] ~= nil then
+        return requiredAnimalOwnedCache[animalName]
+    end
+
+    if not playerPlotId then
+        requiredAnimalOwnedCache[animalName] = false
+        return false
+    end
+
+    local plots = Workspace:FindFirstChild("Plots")
+    if not plots then
+        requiredAnimalOwnedCache[animalName] = false
+        return false
+    end
+
+    local plot = plots:FindFirstChild(playerPlotId)
+    if not plot then
+        requiredAnimalOwnedCache[animalName] = false
+        return false
+    end
+
+    local animalPodiums = plot:FindFirstChild("AnimalPodiums")
+    if not animalPodiums then
+        requiredAnimalOwnedCache[animalName] = false
+        return false
+    end
+
+    for _, podium in ipairs(animalPodiums:GetChildren()) do
+        local base = podium:FindFirstChild("Base")
+        if base then
+            local spawn = base:FindFirstChild("Spawn")
+            if spawn then
+                local attachment = spawn:FindFirstChild("Attachment")
+                if attachment then
+                    local animalOverhead = attachment:FindFirstChild("AnimalOverhead")
+                    if animalOverhead then
+                        local displayName = animalOverhead:FindFirstChild("DisplayName")
+                        local nameText = nil
+                        if displayName then
+                            if displayName:IsA("TextLabel") or displayName:IsA("TextButton") or displayName:IsA("TextBox") then
+                                nameText = displayName.Text
+                            elseif displayName:IsA("StringValue") then
+                                nameText = displayName.Value
+                            end
+                        end
+                        if nameText and nameText:lower() == animalName:lower() then
+                            requiredAnimalOwnedCache[animalName] = true
+                            return true
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    requiredAnimalOwnedCache[animalName] = false
+    return false
+end
+
+-- Delete/remove all brainrots from podiums (sells every attachment)
+local function ClearAllPodiumBrainrots()
+    if not playerPlotId then
+        return false
+    end
+
+    local plots = Workspace:FindFirstChild("Plots")
+    if not plots then
+        return false
+    end
+
+    local plot = plots:FindFirstChild(playerPlotId)
+    if not plot then
+        return false
+    end
+
+    local animalPodiums = plot:FindFirstChild("AnimalPodiums")
+    if not animalPodiums then
+        return false
+    end
+
+    local soldAny = false
+    for podiumIndex = 1, 10 do
+        local podium = animalPodiums:FindFirstChild(tostring(podiumIndex))
+        if podium then
+            local base = podium:FindFirstChild("Base")
+            if base then
+                local spawn = base:FindFirstChild("Spawn")
+                if spawn then
+                    local attachment = spawn:FindFirstChild("Attachment")
+                    if attachment then
+                        -- Skip selling if the podium has a required animal (e.g., Trippi Troppi, Gangster Footera)
+                        local protected = false
+                        local nameValue = nil
+                        local animalOverhead = attachment:FindFirstChild("AnimalOverhead")
+                        if animalOverhead then
+                            local displayName = animalOverhead:FindFirstChild("DisplayName")
+                            if displayName then
+                                if displayName:IsA("TextLabel") or displayName:IsA("TextButton") or displayName:IsA("TextBox") then
+                                    nameValue = displayName.Text
+                                elseif displayName:IsA("StringValue") then
+                                    nameValue = displayName.Value
+                                end
+                            end
+                        end
+                        if nameValue then
+                            local lower = nameValue:lower()
+                            for _, req in ipairs(TARGET_ANIMALS) do
+                                if lower == req:lower() then
+                                    protected = true
+                                    break
+                                end
+                            end
+                        end
+
+                        if not protected then
+                            local sold = SellBrainrot(podiumIndex)
+                            soldAny = sold or soldAny
+                        else
+                            print("[REBIRTH] Skipping sale of required animal on podium " .. podiumIndex .. " (" .. (nameValue or "Unknown") .. ")")
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if soldAny then
+        baseFullCache.lastCheck = 0
+        lowestGenCache.lastCheck = 0
+        InvalidateRequiredAnimalCache()
+    end
+
+    return soldAny
+end
+-- Check if a model is a brainrot animal
+local function IsBrainrotAnimal(model)
+    if not model or not model:IsA("Model") then
+        return false
+    end
+    
+    -- Check if it has the structure: Part.PromptAttachment.ProximityPrompt
+    local part = model:FindFirstChild("Part")
+    if not part then
+        return false
+    end
+    
+    local promptAttachment = part:FindFirstChild("PromptAttachment")
+    if not promptAttachment then
+        return false
+    end
+    
+    local proximityPrompt = promptAttachment:FindFirstChild("ProximityPrompt")
+    if not proximityPrompt or not proximityPrompt:IsA("ProximityPrompt") then
+        return false
+    end
+    
+    return true, part, proximityPrompt
+end
+
+-- Get animal info (including generation)
+local function GetAnimalInfo(model)
+    local part = model:FindFirstChild("Part")
+    if not part then
+        return nil
+    end
+    
+    local info = part:FindFirstChild("Info")
+    if not info then
+        return nil
+    end
+    
+    local animalOverhead = info:FindFirstChild("AnimalOverhead")
+    if not animalOverhead then
+        return nil
+    end
+    
+    local displayName = animalOverhead:FindFirstChild("DisplayName")
+    local priceText = animalOverhead:FindFirstChild("Price")
+    local generation = animalOverhead:FindFirstChild("Generation")
+    
+    local name = "Unknown"
+    if displayName then
+        if displayName:IsA("TextLabel") or displayName:IsA("TextButton") or displayName:IsA("TextBox") then
+            name = displayName.Text
+        elseif displayName:IsA("StringValue") then
+            name = displayName.Value
+        end
+    end
+    
+    local price = 0
+    if priceText then
+        local priceString = ""
+        
+        -- Get the text from TextLabel
+        if priceText:IsA("TextLabel") or priceText:IsA("TextButton") or priceText:IsA("TextBox") then
+            priceString = priceText.Text
+        elseif priceText:IsA("StringValue") then
+            priceString = priceText.Value
+        elseif priceText:IsA("IntValue") or priceText:IsA("NumberValue") then
+            price = priceText.Value
+        end
+        
+        -- Extract number from price text (e.g., "$250" -> 250, "$4,500" -> 4500, "$4.5k" -> 4500, "$3.5M" -> 3500000)
+        if priceString ~= "" then
+            local lowerPrice = priceString:lower()
+            
+            -- Check for "M" notation (millions)
+            local hasM = lowerPrice:find("m")
+            if hasM then
+                -- Remove everything except digits and decimal point
+                local numStr = priceString:gsub("[^%d%.]", "")
+                local num = tonumber(numStr) or 0
+                price = math.floor(num * 1000000) -- Convert to full number (e.g., 3.5 -> 3500000)
+            -- Check for "k" notation (thousands)
+            elseif lowerPrice:find("k") then
+                -- Remove everything except digits and decimal point
+                local numStr = priceString:gsub("[^%d%.]", "")
+                local num = tonumber(numStr) or 0
+                price = math.floor(num * 1000) -- Convert to full number (e.g., 4.5 -> 4500)
+            else
+                -- Remove all non-digit characters (dollar signs, commas, spaces, etc.)
+                local priceStr = priceString:gsub("[^%d]", "")
+                price = tonumber(priceStr) or 0
+            end
+        end
+    end
+    
+    local genText = "Unknown"
+    local genValue = 0
+    if generation then
+        if generation:IsA("TextLabel") or generation:IsA("TextButton") or generation:IsA("TextBox") then
+            genText = generation.Text
+        elseif generation:IsA("StringValue") then
+            genText = generation.Value
+        end
+        genValue = ParseGeneration(genText)
+    end
+    
+    return {
+        Name = name,
+        Price = price,
+        Generation = genText,
+        GenerationValue = genValue,
+        Part = part,
+        Model = model
+    }
+end
+
+-- Check if animal is purchasable
+local function IsAnimalPurchasable(model)
+    local isValid, part, prompt = IsBrainrotAnimal(model)
+    if not isValid then
+        return false
+    end
+    
+    -- Check if disabled
+    if prompt:GetAttribute("Disabled") then
+        return false
+    end
+    
+    -- Check if enabled
+    if not prompt.Enabled then
+        return false
+    end
+    
+    -- Check if already targeted by someone else
+    local targetPlayer = prompt:GetAttribute("TargetPlayer")
+    if targetPlayer and targetPlayer ~= LocalPlayer.UserId then
+        return false
+    end
+    
+    return true
+end
+
+-- Walk to moving target (smoothly follows using Heartbeat)
+local function WalkToMovingTarget(getTargetPosition, maxDistance)
+    if type(getTargetPosition) ~= "function" then
+        warn("[ERROR] getTargetPosition is not a function!")
+        return
+    end
+    
+    maxDistance = maxDistance or PURCHASE_DISTANCE
+    
+    local lastPathTime = 0
+    local pathUpdateInterval = 0.2 -- Update path every 0.2 seconds
+    local maxTime = 30 -- Maximum time to follow (30 seconds)
+    local startTime = tick()
+    local connection = nil
+    local currentWaypoint = nil
+    local waypointIndex = 1
+    local waypoints = {}
+    
+    -- Use Heartbeat for smooth movement
+    connection = RunService.Heartbeat:Connect(function()
+        -- Highest priority override
+        if isLockingBase then
+            if connection then connection:Disconnect() end
+            return
+        end
+        -- Ensure character references are valid
+        if not Character or not Character.Parent then
+            Character = LocalPlayer.Character
+            if not Character then
+                if connection then
+                    connection:Disconnect()
+                end
+                return
+            end
+        end
+        
+        if not HumanoidRootPart or not HumanoidRootPart.Parent then
+            HumanoidRootPart = Character:FindFirstChild("HumanoidRootPart")
+            if not HumanoidRootPart then
+                if connection then
+                    connection:Disconnect()
+                end
+                return
+            end
+        end
+        
+        if not Humanoid or not Humanoid.Parent then
+            Humanoid = Character:FindFirstChild("Humanoid")
+            if not Humanoid then
+                if connection then
+                    connection:Disconnect()
+                end
+                return
+            end
+        end
+        
+        -- Check timeout
+        if tick() - startTime > maxTime then
+            print("[DEBUG] Timeout reached while following target")
+            if connection then
+                connection:Disconnect()
+            end
+            return
+        end
+        
+        local targetPosition = nil
+        local success, result = pcall(function()
+            return getTargetPosition()
+        end)
+        
+        if not success or not result then
+            print("[DEBUG] Target no longer exists or getTargetPosition failed")
+            if connection then
+                connection:Disconnect()
+            end
+            return
+        end
+        
+        targetPosition = result
+        
+        local distance = (HumanoidRootPart.Position - targetPosition).Magnitude
+        
+        -- If we're close enough, stop walking
+        if distance <= maxDistance then
+            pcall(function()
+                Humanoid:MoveTo(HumanoidRootPart.Position) -- Stop moving
+            end)
+            if connection then
+                connection:Disconnect()
+            end
+            return
+        end
+        
+        -- Update path periodically
+        local currentTime = tick()
+        local shouldUpdatePath = (currentTime - lastPathTime) >= pathUpdateInterval
+        
+        if shouldUpdatePath then
+            local pathSuccess, path = pcall(function()
+                return PathfindingService:CreatePath({
+                    AgentRadius = 2,
+                    AgentHeight = 5,
+                    AgentCanJump = true
+                })
+            end)
+            
+            if pathSuccess and path then
+                local computeSuccess, errorMessage = pcall(function()
+                    path:ComputeAsync(HumanoidRootPart.Position, targetPosition)
+                end)
+                
+                if computeSuccess and path.Status == Enum.PathStatus.Success then
+                    waypoints = path:GetWaypoints()
+                    waypointIndex = 2 -- Start from waypoint 2 (skip first)
+                    lastPathTime = currentTime
+                end
+            end
+        end
+        
+        -- Move to next waypoint if we have a path
+        if #waypoints > 1 then
+            -- Start from waypoint 2 (skip first which is current position)
+            if waypointIndex < 2 then
+                waypointIndex = 2
+            end
+            
+            -- Check if we've reached the current waypoint
+            if waypointIndex <= #waypoints then
+                currentWaypoint = waypoints[waypointIndex]
+                local waypointDistance = (HumanoidRootPart.Position - currentWaypoint.Position).Magnitude
+                
+                if waypointDistance < 4 then
+                    -- Move to next waypoint
+                    waypointIndex = waypointIndex + 1
+                    if waypointIndex <= #waypoints then
+                        pcall(function()
+                            Humanoid:MoveTo(waypoints[waypointIndex].Position)
+                        end)
+                    else
+                        -- Reached end of path, move directly to target
+                        pcall(function()
+                            Humanoid:MoveTo(targetPosition)
+                        end)
+                    end
+                else
+                    -- Continue moving to current waypoint
+                    pcall(function()
+                        Humanoid:MoveTo(currentWaypoint.Position)
+                    end)
+                end
+            else
+                -- Reached end of path, move directly to target
+                pcall(function()
+                    Humanoid:MoveTo(targetPosition)
+                end)
+            end
+        else
+            -- No path or pathfinding failed, move directly to target
+            pcall(function()
+                Humanoid:MoveTo(targetPosition)
+            end)
+        end
+    end)
+    
+    -- Wait until connection is disconnected (target reached or timeout)
+    while connection and connection.Connected do
+        task.wait(0.1)
+    end
+end
+
+-- Purchase animal by holding E
+local function PurchaseAnimal(model)
+    if not model or not model.Parent then
+        return false
+    end
+    
+    local isValid, part, prompt = IsBrainrotAnimal(model)
+    if not isValid then
+        return false
+    end
+    
+    -- Get animal UID for remote events
+    local animalUID = prompt:GetAttribute("UID")
+    if not animalUID then
+        animalUID = model:GetAttribute("UID") or model.Name
+    end
+    
+    -- Fire remote events (from AnimalController)
+    local serverTime = workspace:GetServerTimeNow() + 159
+    pcall(function()
+        RemoteEvent:FireServer(serverTime, "bee1f514-73ec-4598-8df6-e25dd89b6f73", animalUID)
+    end)
+    pcall(function()
+        RemoteEvent:FireServer(serverTime, "338d0008-b86e-45c8-b1f6-50aaf710e48d", animalUID)
+    end)
+    
+    -- Hold the proximity prompt (simulates holding E)
+    if prompt.Enabled then
+        prompt:InputHoldBegin()
+        task.wait(HOLD_DURATION)
+        prompt:InputHoldEnd()
+        return true
+    end
+    
+    return false
+end
+
+-- Main autofarm loop
+local isPurchasing = false
+local currentTarget = nil
+local purchasedAnimals = {}
+local savedActivity = nil -- Save activity to resume after interruptions
+
+-- Attempt to select moving animal by name and purchase it
+local function PurchaseAnimalByName(targetName)
+    local targetLower = targetName:lower()
+    local candidate = nil
+    for _, model in ipairs(Workspace:GetChildren()) do
+        if model:IsA("Model") then
+            local isValid, part, prompt = IsBrainrotAnimal(model)
+            if isValid and prompt.Enabled then
+                local info = GetAnimalInfo(model)
+                if info and info.Name:lower() == targetLower then
+                    candidate = { Model = model, Part = part, Info = info }
+                    break
+                end
+            end
+        end
+    end
+
+    if not candidate then
+        return false
+    end
+
+    local model = candidate.Model
+    local part = candidate.Part
+    local info = candidate.Info
+
+    currentActivity = "purchasing"
+    isPurchasing = true
+    currentTarget = model
+
+    local function getTargetPosition()
+        if part.Parent and model.Parent then
+            return part.Position
+        end
+        return nil
+    end
+
+    -- If base lock started, abort immediately
+    if isLockingBase then
+        isPurchasing = false
+        currentTarget = nil
+        currentActivity = nil
+        return false
+    end
+
+    WalkToMovingTarget(getTargetPosition, PURCHASE_DISTANCE)
+
+    local success = false
+    if not isLockingBase and model.Parent and part.Parent and HumanoidRootPart then
+        local distance = (HumanoidRootPart.Position - part.Position).Magnitude
+        if distance <= PURCHASE_DISTANCE then
+            success = PurchaseAnimal(model)
+        else
+            print("[REBIRTH] Could not reach " .. info.Name .. " (" .. math.floor(distance) .. " studs)")
+        end
+    end
+
+    isPurchasing = false
+    currentTarget = nil
+    currentActivity = nil
+
+    if success then
+        print("[REBIRTH] Purchased required animal: " .. info.Name)
+        requiredAnimalOwnedCache[info.Name] = true
+        baseFullCache.lastCheck = 0
+        lowestGenCache.lastCheck = 0
+        return true
+    end
+
+    return false
+end
+
+local function HaveAllRequiredAnimals()
+    for _, animalName in ipairs(TARGET_ANIMALS) do
+        if not IsRequiredAnimalOwned(animalName) then
+            return false
+        end
+    end
+    return true
+end
+
+local function EnsureRequiredAnimals()
+    -- Try until both are owned or timeout, purchasing whichever is available first
+    local deadline = tick() + 25
+    while tick() < deadline do
+        -- Check completion first
+        if HaveAllRequiredAnimals() then
+            return true
+        end
+
+        for _, animalName in ipairs(TARGET_ANIMALS) do
+            if not IsRequiredAnimalOwned(animalName) then
+                print("[REBIRTH] Missing required animal '" .. animalName .. "', attempting to purchase...")
+                local purchased = PurchaseAnimalByName(animalName)
+                if purchased then
+                    -- small delay to allow UI/world to update
+                    task.wait(0.5)
+                else
+                    -- If this one failed, try the other in the same loop iteration
+                    task.wait(0.2)
+                end
+            end
+        end
+
+        task.wait(0.3)
+    end
+
+    return HaveAllRequiredAnimals()
+end
+
+local function CanAttemptRebirth()
+    local currentCash = GetPlayerMoney()
+    if currentCash < REBIRTH_CASH_THRESHOLD then
+        return false, "Insufficient cash"
+    end
+    if rebirthSequenceCompleted then
+        return false, "Rebirth already completed"
+    end
+    if not playerPlotId then
+        return false, "Plot not identified"
+    end
+    if tick() - lastRebirthAttempt < REBIRTH_RETRY_DELAY then
+        return false, "Waiting retry delay"
+    end
+    return true
+end
+
+local function TryRebirth()
+    local canAttempt, reason = CanAttemptRebirth()
+    if not canAttempt then
+        return false, reason
+    end
+
+    if rebirthSequenceActive then
+        return false, "Sequence already running"
+    end
+
+    rebirthSequenceActive = true
+    savedActivity = currentActivity
+    currentActivity = "rebirthing"
+    print("[REBIRTH] Starting rebirth sequence...")
+
+    local sold = ClearAllPodiumBrainrots()
+    if sold then
+        print("[REBIRTH] Cleared existing podium brainrots to prepare for required purchases")
+    else
+        print("[REBIRTH] No podium brainrots needed to clear or sell failed")
+    end
+
+    local ensured = EnsureRequiredAnimals()
+    if not ensured then
+        print("[REBIRTH] Required animals not secured, aborting sequence")
+        rebirthSequenceActive = false
+        currentActivity = savedActivity
+        savedActivity = nil
+        lastRebirthAttempt = tick()
+        return false, "Missing animals"
+    end
+
+    local success, message = pcall(function()
+        return RebirthRemoteFunction:InvokeServer()
+    end)
+
+    lastRebirthAttempt = tick()
+
+    if success and message then
+        print("[REBIRTH] Rebirth successful! Message:", message)
+        rebirthSequenceCompleted = true
+        rebirthSequenceActive = false
+        currentActivity = nil
+        savedActivity = nil
+        return true
+    else
+        print("[REBIRTH] Rebirth failed:", message)
+        rebirthSequenceActive = false
+        currentActivity = savedActivity
+        savedActivity = nil
+        return false, message or "Unknown failure"
+    end
+end
+
+local function StartAutoFarm()
+    print("AutoFarm is running...")
+    print("Scanning workspace for brainrots...")
+    print("Auto-collect enabled: Every " .. COLLECT_INTERVAL .. " seconds")
+    -- Create overlay UI and disable 3D rendering to reduce CPU/GPU
+    CreateOrEnsureOverlay()
+    pcall(function() RunService:Set3dRenderingEnabled(false) end)
+    -- Periodic overlay updater (1 Hz)
+    task.spawn(function()
+        while true do
+            UpdateOverlayStatus()
+            task.wait(1)
+        end
+    end)
+    
+    -- PRIORITY 1: Base locking check loop (OVERRIDES EVERYTHING)
+    local baseCheckCount = 0
+    task.spawn(function()
+        while true do
+            if playerPlotId then
+                local timeText = GetBaseRemainingTime()
+                local unlocked = IsBaseUnlocked()
+                
+                -- Print status every 20 checks (about every 6 seconds) for debugging
+                baseCheckCount = baseCheckCount + 1
+                if baseCheckCount % 20 == 0 and timeText then
+                    print("[BASE STATUS] Remaining time:", timeText, "Unlocked:", unlocked)
+                end
+                
+                if unlocked and not isLockingBase then
+                    print("[PRIORITY 1] Base is unlocked! Remaining time:", timeText or "Unknown")
+                    print("[PRIORITY 1] Overriding all activities to lock base...")
+                    
+                    -- Save current activity to resume later
+                    if currentActivity and currentActivity ~= "locking" then
+                        savedActivity = currentActivity
+                    end
+                    
+                    LockBase()
+                elseif unlocked and isLockingBase then
+                    -- Already locking, just wait
+                end
+            else
+                -- Try to find plot again if we don't have it
+                if not playerPlotId then
+                    playerPlotId = FindPlayerPlot()
+                    if playerPlotId then
+                        print("[INFO] Found plot ID:", playerPlotId)
+                    end
+                end
+            end
+            task.wait(0.3) -- Check every 0.3 seconds (more frequent)
+        end
+    end)
+    
+    -- PRIORITY 2: Auto-collect timer (runs every 20 seconds)
+    task.spawn(function()
+        while true do
+            task.wait(COLLECT_INTERVAL)
+            
+            if playerPlotId and not isCollecting and not rebirthSequenceActive then
+                -- Wait for current purchasing to finish before collecting
+                if isPurchasing then
+                    print("[INFO] Waiting for current purchase to finish before collecting...")
+                    while isPurchasing do
+                        task.wait(0.5)
+                    end
+                end
+                
+                -- Don't collect if base is being locked
+                if not isLockingBase then
+                    CollectMoney()
+                else
+                    print("[INFO] Skipping collection due to base locking")
+                end
+            end
+        end
+    end)
+    
+    -- PRIORITY 2.5: Yin Yang auto-spin when cash is low for extended period
+    task.spawn(function()
+        while true do
+            task.wait(1)
+            if rebirthSequenceActive then
+                -- Do not spin during rebirth sequence
+                lastLowCashStart = nil
+            else
+                local cash = GetPlayerMoney()
+                if cash < YINYANG_CASH_THRESHOLD then
+                    if not lastLowCashStart then
+                        lastLowCashStart = tick()
+                    end
+                    if (tick() - lastLowCashStart) >= YINYANG_DROUGHT_SECONDS then
+                        if (tick() - lastYinYangSpinAttempt) > 10 then
+                            print("[YINYANG] Low cash (" .. cash .. "). Spinning Yin Yang wheel...")
+                            pcall(function()
+                                YinYangSpinRemoteEvent:FireServer()
+                            end)
+                            lastYinYangSpinAttempt = tick()
+                            -- Reset the window so we do not spam spins
+                            lastLowCashStart = tick()
+                        end
+                    end
+                else
+                    lastLowCashStart = nil
+                end
+            end
+        end
+    end)
+    
+    -- PRIORITY 3: Purchase/Upgrade brainrots (lowest priority)
+    task.spawn(function()
+        local lastUpgradeModeLog = 0
+        local lastScannedClear = tick()
+        
+        while true do
+            -- Periodically clear scanned animals cache (every 30 seconds) in case money increased
+            if (tick() - lastScannedClear) > 30 then
+                scannedAnimals = {}
+                lastScannedClear = tick()
+            end
+
+            if not isPurchasing and not isLockingBase and not isCollecting and not isUpgrading and not rebirthSequenceActive then
+                local currentMoney = GetPlayerMoney()
+                local skipPurchasing = false
+
+                if currentMoney >= REBIRTH_CASH_THRESHOLD and not rebirthSequenceCompleted then
+                    local rebirthSuccess, rebirthMessage = TryRebirth()
+                    if rebirthSuccess then
+                        print("[REBIRTH] Completed rebirth sequence successfully")
+                    else
+                        print("[REBIRTH] Rebirth attempt skipped/failed:", rebirthMessage)
+                    end
+                    task.wait(1)
+                    skipPurchasing = true
+                end
+
+                if not skipPurchasing then
+                    -- Check if base is full - if so, enable upgrade mode (CACHED)
+                    local baseFull = IsBaseFull()
+                    local lowestInBase = nil
+                    
+                    if baseFull then
+                        lowestInBase = GetLowestGenerationPodium()
+                        -- Only log upgrade mode occasionally to reduce spam
+                        if lowestInBase and (tick() - lastUpgradeModeLog) > 10 then
+                            print("[UPGRADE MODE] Base is full! Lowest generation: " .. lowestInBase.GenerationText .. " on podium " .. lowestInBase.PodiumNumber)
+                            lastUpgradeModeLog = tick()
+                        end
+                    end
+
+                    -- SMART PURCHASING: Find the BEST brainrot we can afford
+                    local bestBrainrot = nil
+                    local bestGeneration = baseFull and lowestInBase and lowestInBase.Generation or 0
+                    local isUpgradeMode = baseFull and lowestInBase ~= nil
+
+                    -- Scan workspace for brainrot animals (optimized)
+                    local workspaceChildren = Workspace:GetChildren()
+                    for _, model in pairs(workspaceChildren) do
+                        -- Skip if already processed or currently targeted
+                        if model:IsA("Model") and not purchasedAnimals[model] and model ~= currentTarget and not scannedAnimals[model] then
+                            local isValid, part, prompt = IsBrainrotAnimal(model)
+                            
+                            if isValid and IsAnimalPurchasable(model) then
+                                -- Get animal info
+                                local animalInfo = GetAnimalInfo(model)
+                                
+                                if animalInfo then
+                                    local price = animalInfo.Price
+                                    local gen = animalInfo.GenerationValue
+
+                                    -- Check if this is a candidate
+                                    local isCandidate = false
+
+                                    if isUpgradeMode then
+                                        -- UPGRADE MODE: Must be better than lowest AND affordable
+                                        if gen > lowestInBase.Generation and currentMoney >= price and price > 0 then
+                                            isCandidate = true
+                                        else
+                                            scannedAnimals[model] = true
+                                        end
+                                    else
+                                        -- NORMAL MODE: Just needs to be affordable
+                                        if (price > 0 and currentMoney >= price) or price == 0 then
+                                            isCandidate = true
+                                        else
+                                            scannedAnimals[model] = true
+                                        end
+                                    end
+
+                                    -- If candidate, check if it's the BEST we've found
+                                    if isCandidate then
+                                        if gen > bestGeneration or (gen == bestGeneration and (not bestBrainrot or price < bestBrainrot.Price)) then
+                                            bestBrainrot = animalInfo
+                                            bestGeneration = gen
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+
+                    -- Now purchase the BEST brainrot we found
+                    if bestBrainrot then
+                        local model = bestBrainrot.Model
+                        local part = bestBrainrot.Part
+                        local price = bestBrainrot.Price
+                        local isUpgrade = isUpgradeMode
+                        
+                        print("[SMART BUY] Selected BEST brainrot: " .. bestBrainrot.Name .. " Gen: " .. bestBrainrot.Generation .. " Price: $" .. price)
+                        
+                        -- If this is an upgrade, sell the lowest first
+                        if isUpgrade and lowestInBase then
+                            isUpgrading = true
+                            currentActivity = "upgrading"
+                            
+                            print("[UPGRADE] Selling lowest generation brainrot first...")
+                            local soldSuccessfully = SellBrainrot(lowestInBase.PodiumNumber)
+                            
+                            if not soldSuccessfully then
+                                print("[WARNING] Failed to sell brainrot, skipping upgrade")
+                                isUpgrading = false
+                                currentActivity = nil
+                                task.wait(1)
+                            else
+                                task.wait(0.5) -- Small delay after selling
+                                isUpgrading = false
+                                
+                                -- Continue to purchase
+                                isPurchasing = true
+                                currentTarget = model
+                                currentActivity = "purchasing"
+                                
+                                task.spawn(function()
+                                    print("[UPGRADE] Targeting " .. bestBrainrot.Name .. " Gen: " .. bestBrainrot.Generation .. " Price: $" .. price)
+                                    
+                                    -- Continuously follow the moving animal
+                                    local function getTargetPosition()
+                                        if not model.Parent or not part.Parent then
+                                            return nil
+                                        end
+                                        return part.Position
+                                    end
+                                    
+                                    -- Walk to the moving target
+                                    WalkToMovingTarget(getTargetPosition, PURCHASE_DISTANCE)
+                                    
+                                    -- Check if we're close enough to purchase
+                                    if model.Parent and part.Parent then
+                                        local distance = (HumanoidRootPart.Position - part.Position).Magnitude
+                                        
+                                        if distance <= PURCHASE_DISTANCE then
+                                            -- Purchase the animal
+                                            print("[INFO] Purchasing " .. bestBrainrot.Name .. " for $" .. price)
+                                            if PurchaseAnimal(model) then
+                                                purchasedAnimals[model] = true
+                                                print("[SUCCESS] Purchased " .. bestBrainrot.Name)
+                                                -- Invalidate caches since base changed
+                                                baseFullCache.lastCheck = 0
+                                                lowestGenCache.lastCheck = 0
+                                                task.wait(1) -- Wait before next purchase
+                                            else
+                                                print("[WARNING] Failed to purchase " .. bestBrainrot.Name)
+                                            end
+                                        else
+                                            print("[DEBUG] Could not reach " .. bestBrainrot.Name .. ", Final distance: " .. math.floor(distance))
+                                        end
+                                    else
+                                        print("[DEBUG] Animal " .. bestBrainrot.Name .. " no longer exists")
+                                    end
+                                    
+                                    isPurchasing = false
+                                    currentTarget = nil
+                                    currentActivity = nil
+                                end)
+                            end
+                        else
+                            -- Normal mode purchase (no upgrade needed)
+                            isPurchasing = true
+                            currentTarget = model
+                            currentActivity = "purchasing"
+                            
+                            task.spawn(function()
+                                print("[PRIORITY 3] Targeting " .. bestBrainrot.Name .. " Gen: " .. bestBrainrot.Generation .. " Price: $" .. price)
+                                
+                                -- Continuously follow the moving animal
+                                local function getTargetPosition()
+                                    if not model.Parent or not part.Parent then
+                                        return nil
+                                    end
+                                    return part.Position
+                                end
+                                
+                                -- Walk to the moving target
+                                WalkToMovingTarget(getTargetPosition, PURCHASE_DISTANCE)
+                                if isLockingBase then
+                                    isPurchasing = false
+                                    currentTarget = nil
+                                    currentActivity = nil
+                                    return
+                                end
+                                if isLockingBase then
+                                    isPurchasing = false
+                                    currentTarget = nil
+                                    currentActivity = nil
+                                    return
+                                end
+                                if isLockingBase then
+                                    isPurchasing = false
+                                    currentTarget = nil
+                                    currentActivity = nil
+                                    return
+                                end
+                                
+                                -- Check if we're close enough to purchase
+                                if model.Parent and part.Parent then
+                                    local distance = (HumanoidRootPart.Position - part.Position).Magnitude
+                                    
+                                    if distance <= PURCHASE_DISTANCE then
+                                        -- Purchase the animal
+                                        print("[INFO] Purchasing " .. bestBrainrot.Name .. " for $" .. price)
+                                        if PurchaseAnimal(model) then
+                                            purchasedAnimals[model] = true
+                                            print("[SUCCESS] Purchased " .. bestBrainrot.Name)
+                                            -- Invalidate caches since base changed
+                                            baseFullCache.lastCheck = 0
+                                            lowestGenCache.lastCheck = 0
+                                            task.wait(1) -- Wait before next purchase
+                                        else
+                                            print("[WARNING] Failed to purchase " .. bestBrainrot.Name)
+                                        end
+                                    else
+                                        print("[DEBUG] Could not reach " .. bestBrainrot.Name .. ", Final distance: " .. math.floor(distance))
+                                    end
+                                else
+                                    print("[DEBUG] Animal " .. bestBrainrot.Name .. " no longer exists")
+                                end
+                                
+                                isPurchasing = false
+                                currentTarget = nil
+                                currentActivity = nil
+                            end)
+                        end
+                    end
+
+                    -- Clean up purchased animals and scanned animals that no longer exist
+                    for animal, _ in pairs(purchasedAnimals) do
+                        if not animal.Parent then
+                            purchasedAnimals[animal] = nil
+                        end
+                    end
+                    
+                    for animal, _ in pairs(scannedAnimals) do
+                        if not animal.Parent then
+                            scannedAnimals[animal] = nil
+                        end
+                    end
+                end
+            end
+            task.wait(CHECK_INTERVAL)
+        end
+    end)
+    Humanoid = Character:WaitForChild("Humanoid")
+    print("[DEBUG] Character respawned, updated references")
+end
+
+LocalPlayer.CharacterAdded:Connect(function(newCharacter)
+    Character = newCharacter
+    HumanoidRootPart = newCharacter:WaitForChild("HumanoidRootPart")
+    Humanoid = newCharacter:WaitForChild("Humanoid")
+    print("[DEBUG] Character respawned, updated references")
+end)
+
+-- Find and cache player's plot ID
+print("[INFO] Finding your base plot...")
+playerPlotId = FindPlayerPlot()
+
+if playerPlotId then
+    print("[SUCCESS] Your base plot ID cached:", playerPlotId)
+else
+    print("[WARNING] Could not find your base plot. Base locking will not work.")
+end
+
+-- Start the autofarm
+StartAutoFarm()
+
+print("=== AutoFarm Brainrots Script Loaded! ===")
+print("The script will automatically find and purchase brainrots from workspace.")
+if playerPlotId then
+    print("Base auto-locking is enabled! (PRIORITY 1 - Overrides everything)")
+    print("Auto-collect is enabled! (PRIORITY 2 - Every " .. COLLECT_INTERVAL .. " seconds)")
+    print("Auto-upgrade is enabled! (PRIORITY 3 - Sells lowest gen, buys higher gen)")
+    print("Auto-purchase is enabled! (PRIORITY 3 - Fills empty slots)")
+else
+    print("Warning: Plot ID not found. Base locking and auto-collect disabled.")
+end
+print("Your current cash: $" .. GetPlayerMoney())
+print("")
+print("Priority System:")
+print("  1. Lock Base (Immediate override)")
+print("  2. Collect Money (Waits for current task)")
+print("  3. Upgrade/Purchase Brainrots (Lowest priority)")
+print("")
+print("Upgrade System:")
+print("  - When base is full, only buys brainrots with higher generation")
+print("  - Automatically sells lowest generation brainrot first")
+print("  - Ensures you can afford the upgrade before selling")
